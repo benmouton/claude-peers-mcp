@@ -41,9 +41,13 @@ db.run(`
     tty TEXT,
     summary TEXT NOT NULL DEFAULT '',
     registered_at TEXT NOT NULL,
-    last_seen TEXT NOT NULL
+    last_seen TEXT NOT NULL,
+    is_remote INTEGER NOT NULL DEFAULT 0
   )
 `);
+
+// Migration: add is_remote column if missing (existing installs)
+try { db.run("ALTER TABLE peers ADD COLUMN is_remote INTEGER NOT NULL DEFAULT 0"); } catch { /* already exists */ }
 
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
@@ -58,10 +62,20 @@ db.run(`
   )
 `);
 
+const REMOTE_PEER_TTL_MS = 5 * 60 * 1000; // 5 minutes without heartbeat
+
 // Clean up stale peers (PIDs that no longer exist) on startup
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+  const peers = db.query("SELECT id, pid, is_remote, last_seen FROM peers").all() as { id: string; pid: number; is_remote: number; last_seen: string }[];
   for (const peer of peers) {
+    if (peer.is_remote) {
+      const age = Date.now() - new Date(peer.last_seen).getTime();
+      if (age > REMOTE_PEER_TTL_MS) {
+        db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
+        db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
+      }
+      continue;
+    }
     try {
       // Check if process is still alive (signal 0 doesn't kill, just checks)
       process.kill(peer.pid, 0);
@@ -184,8 +198,9 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // Verify each peer's process is still alive
-  return peers.filter((p) => {
+  // Verify each peer's process is still alive (skip remote peers)
+  return peers.filter((p: any) => {
+    if (p.is_remote) return true; // Remote peers can't be PID-checked
     try {
       process.kill(p.pid, 0);
       return true;
@@ -195,6 +210,18 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
       return false;
     }
   });
+}
+
+function handleRegisterRemote(body: { id: string; cwd: string; summary: string; machine?: string }): { ok: boolean } {
+  const now = new Date().toISOString();
+  // Remove existing registration for this remote ID
+  deletePeer.run(body.id);
+  db.run(
+    `INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen, is_remote)
+     VALUES (?, 0, ?, NULL, ?, ?, ?, ?, 1)`,
+    [body.id, body.cwd || "", body.machine || "remote", body.summary || "", now, now]
+  );
+  return { ok: true };
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
@@ -227,7 +254,7 @@ function handleUnregister(body: { id: string }): void {
 
 Bun.serve({
   port: PORT,
-  hostname: "127.0.0.1",
+  hostname: "0.0.0.0",
   async fetch(req) {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -245,6 +272,8 @@ Bun.serve({
       switch (path) {
         case "/register":
           return Response.json(handleRegister(body as RegisterRequest));
+        case "/register-remote":
+          return Response.json(handleRegisterRemote(body as { id: string; cwd: string; summary: string; machine?: string }));
         case "/heartbeat":
           handleHeartbeat(body as HeartbeatRequest);
           return Response.json({ ok: true });

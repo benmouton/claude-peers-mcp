@@ -35,10 +35,24 @@ import {
 // --- Configuration ---
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const BROKER_HOST = process.env.CLAUDE_PEERS_HOST ?? "127.0.0.1";
+const BROKER_URL = `http://${BROKER_HOST}:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+const IS_REMOTE_BROKER = BROKER_HOST !== "127.0.0.1" && BROKER_HOST !== "localhost";
+
+function deterministicRemoteId(): string {
+  const { hostname, username } = require("os").userInfo
+    ? { hostname: require("os").hostname(), username: require("os").userInfo().username }
+    : { hostname: "unknown", username: "unknown" };
+  const raw = `${hostname}:${username}`;
+  let hash = 0;
+  for (let i = 0; i < raw.length; i++) {
+    hash = ((hash << 5) - hash + raw.charCodeAt(i)) | 0;
+  }
+  return "r-" + Math.abs(hash).toString(36).padStart(8, "0").slice(0, 8);
+}
 
 // --- Broker communication ---
 
@@ -488,15 +502,26 @@ async function main() {
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
   // 4. Register with broker
-  const reg = await brokerFetch<RegisterResponse>("/register", {
-    pid: process.pid,
-    cwd: myCwd,
-    git_root: myGitRoot,
-    tty,
-    summary: initialSummary,
-  });
-  myId = reg.id;
-  log(`Registered as peer ${myId}`);
+  if (IS_REMOTE_BROKER) {
+    myId = deterministicRemoteId();
+    await brokerFetch("/register-remote", {
+      id: myId,
+      cwd: myCwd,
+      summary: initialSummary,
+      machine: require("os").hostname(),
+    });
+    log(`Registered as remote peer ${myId} (deterministic)`);
+  } else {
+    const reg = await brokerFetch<RegisterResponse>("/register", {
+      pid: process.pid,
+      cwd: myCwd,
+      git_root: myGitRoot,
+      tty,
+      summary: initialSummary,
+    });
+    myId = reg.id;
+    log(`Registered as peer ${myId}`);
+  }
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
@@ -534,13 +559,16 @@ async function main() {
   const cleanup = async () => {
     clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
-    if (myId) {
+    if (myId && !IS_REMOTE_BROKER) {
       try {
         await brokerFetch("/unregister", { id: myId });
         log("Unregistered from broker");
       } catch {
         // Best effort
       }
+    }
+    if (IS_REMOTE_BROKER) {
+      log("Remote peer — skipping unregister (deterministic ID persists)");
     }
     process.exit(0);
   };
