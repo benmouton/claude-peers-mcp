@@ -37,6 +37,29 @@ export interface RegisterResponse {
 
 export interface HeartbeatRequest {
   id: PeerId;
+  // Optional self-heal payload. When the broker has dropped this peer's row
+  // (most commonly: 90s staleness from a transient outage / broker restart),
+  // a heartbeat with these fields lets the broker UPSERT the peer back into
+  // the table on the same id, instead of silently no-op'ing the UPDATE and
+  // leaving the peer as a one-way ghost. Backward-compatible: heartbeats
+  // without these fields still work, just won't self-heal.
+  pid?: number;
+  cwd?: string;
+  git_root?: string | null;
+  tty?: string | null;
+  summary?: string;
+  is_remote?: boolean;
+}
+
+export interface HeartbeatResponse {
+  ok: boolean;
+  // True when the broker had to INSERT the row instead of UPDATE — useful
+  // for telemetry/logging on the client side.
+  reregistered?: boolean;
+  // True when the broker has no row for this id AND the heartbeat didn't
+  // include enough self-heal data. Client should re-call /register or
+  // /register-remote explicitly.
+  needsRegister?: boolean;
 }
 
 export interface SetSummaryRequest {

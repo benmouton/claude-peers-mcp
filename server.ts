@@ -152,6 +152,12 @@ function getTty(): string | null {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+// ALS-58 follow-up (2026-05-18) — cache for heartbeat self-heal. The heartbeat
+// now sends these so the broker can UPSERT the peer back if its row was dropped
+// (90s staleness, broker restart). Without this cache the heartbeat would still
+// no-op silently and the peer would stay ghost forever.
+let myTty: string | null = null;
+let mySummary = "";
 
 // --- MCP Server ---
 
@@ -354,6 +360,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
+        mySummary = summary; // keep heartbeat self-heal payload current
         return {
           content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }],
         };
@@ -462,6 +469,56 @@ async function pollAndPushMessages() {
   }
 }
 
+// --- Self-greet (SessionStart-hook handoff) ---
+
+async function pushSelfGreet() {
+  const home = process.env.HOME ?? "";
+  if (!home) return;
+  const { createHash } = await import("node:crypto");
+  const cwdHash = createHash("sha1").update(myCwd).digest("hex");
+  const greetPath = `${home}/.cache/claude-peers/greet-${cwdHash}.json`;
+  const file = Bun.file(greetPath);
+  if (!(await file.exists())) return;
+
+  let data: { name: string; session_path: string; session_content: string; created_at: number };
+  try {
+    data = await file.json();
+  } catch {
+    await Bun.$`rm -f ${greetPath}`.quiet();
+    return;
+  }
+
+  // Stale sentinels (>2 min) are ignored — likely a leftover from a crashed start
+  const ageSec = Date.now() / 1000 - (data.created_at ?? 0);
+  if (ageSec > 120) {
+    await Bun.$`rm -f ${greetPath}`.quiet();
+    return;
+  }
+
+  const content = `Auto-greet on session start. Your peer name is **${data.name}**. Read the prior KKN session below, then immediately respond with: "${data.name} checking in — here's where we left off:" followed by a 2-3 sentence recap of the most relevant items (what shipped, what's open, what's next). No user prompt needed — say it now.
+
+Latest KKN session file: ${data.session_path}
+
+--- BEGIN PRIOR SESSION ---
+${data.session_content}
+--- END PRIOR SESSION ---`;
+
+  await mcp.notification({
+    method: "notifications/claude/channel",
+    params: {
+      content,
+      meta: {
+        from_id: "auto-greet",
+        from_summary: "Session bootstrap",
+        from_cwd: myCwd,
+        sent_at: new Date().toISOString(),
+      },
+    },
+  });
+  await Bun.$`rm -f ${greetPath}`.quiet();
+  log(`Pushed self-greet for ${data.name}`);
+}
+
 // --- Startup ---
 
 async function main() {
@@ -472,6 +529,7 @@ async function main() {
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
+  myTty = tty;
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
@@ -522,6 +580,8 @@ async function main() {
     myId = reg.id;
     log(`Registered as peer ${myId}`);
   }
+  // Cache for heartbeat self-heal payload (see HeartbeatRequest in shared/types.ts)
+  mySummary = initialSummary;
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
@@ -529,6 +589,7 @@ async function main() {
       if (initialSummary && myId) {
         try {
           await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
+          mySummary = initialSummary; // keep heartbeat self-heal payload current
           log(`Late auto-summary applied: ${initialSummary}`);
         } catch {
           // Non-critical
@@ -541,14 +602,46 @@ async function main() {
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
+  // 5b. Self-greet — if a SessionStart hook left a pending greet sentinel for
+  // this CWD, push it as a channel notification so Claude announces itself
+  // and recaps the prior KKN session unprompted.
+  setTimeout(() => {
+    pushSelfGreet().catch((e) =>
+      log(`Self-greet failed: ${e instanceof Error ? e.message : String(e)}`)
+    );
+  }, 500);
+
   // 6. Start polling for inbound messages
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
   // 7. Start heartbeat
+  // Self-heal pattern: every heartbeat carries the full peer payload so the
+  // broker can UPSERT on miss (e.g. if our row was dropped by the 90s
+  // staleness cleanup or a broker restart). Without this, a transient gap
+  // turned every peer into a one-way ghost forever — recovery required a
+  // manual curl /register-remote or an MCP server restart.
   const heartbeatTimer = setInterval(async () => {
     if (myId) {
       try {
-        await brokerFetch("/heartbeat", { id: myId });
+        const res = await brokerFetch<{ ok: boolean; reregistered?: boolean; needsRegister?: boolean }>(
+          "/heartbeat",
+          {
+            id: myId,
+            pid: process.pid,
+            cwd: myCwd,
+            git_root: myGitRoot,
+            tty: myTty,
+            summary: mySummary,
+            is_remote: IS_REMOTE_BROKER,
+          },
+        );
+        if (res?.reregistered) {
+          log(`Broker self-healed peer ${myId} via heartbeat upsert`);
+        } else if (res?.needsRegister) {
+          // Legacy fallback: should not happen now that heartbeats carry
+          // self-heal payload, but log it so a regression is visible.
+          log(`Broker requested explicit re-register for ${myId} — heartbeat payload may be incomplete`);
+        }
       } catch {
         // Non-critical
       }

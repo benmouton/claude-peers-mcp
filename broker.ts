@@ -62,27 +62,21 @@ db.run(`
   )
 `);
 
-const REMOTE_PEER_TTL_MS = 5 * 60 * 1000; // 5 minutes without heartbeat
+const STALE_PEER_TTL_MS = 90 * 1000; // 90s without heartbeat — applies to local + remote uniformly
 
-// Clean up stale peers (PIDs that no longer exist) on startup
+// Clean up stale peers — heartbeat-only staleness, no PID check.
+// PID check via process.kill(pid, 0) raises EPERM on cross-user PIDs (broker user
+// can't probe another user's processes), which the broker incorrectly interpreted
+// as "process dead" and silently deleted live peers. Now we trust heartbeats only.
+// Undelivered messages are preserved across peer churn so reconnecting peers
+// can still receive them.
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid, is_remote, last_seen FROM peers").all() as { id: string; pid: number; is_remote: number; last_seen: string }[];
+  const peers = db.query("SELECT id, last_seen FROM peers").all() as { id: string; last_seen: string }[];
   for (const peer of peers) {
-    if (peer.is_remote) {
-      const age = Date.now() - new Date(peer.last_seen).getTime();
-      if (age > REMOTE_PEER_TTL_MS) {
-        db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-        db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
-      }
-      continue;
-    }
-    try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
-    } catch {
-      // Process doesn't exist, remove it
+    const age = Date.now() - new Date(peer.last_seen).getTime();
+    if (age > STALE_PEER_TTL_MS) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
+      // intentionally preserve messages — reconnecting peer can still receive them
     }
   }
 }
@@ -163,8 +157,39 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   return { id };
 }
 
-function handleHeartbeat(body: HeartbeatRequest): void {
-  updateLastSeen.run(new Date().toISOString(), body.id);
+function handleHeartbeat(body: HeartbeatRequest): { ok: boolean; reregistered?: boolean; needsRegister?: boolean } {
+  const now = new Date().toISOString();
+  const result = updateLastSeen.run(now, body.id) as { changes: number };
+
+  if (result.changes > 0) {
+    return { ok: true };
+  }
+
+  // Row missing — broker dropped it (90s staleness, broker restart, etc.).
+  // If the heartbeat carries self-heal payload, INSERT to re-establish the
+  // peer with the same id. Otherwise tell the client to re-call /register
+  // explicitly (legacy clients without the payload).
+  if (body.cwd !== undefined) {
+    deletePeer.run(body.id); // belt-and-suspenders: clear any zombie row
+    db.run(
+      `INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen, is_remote)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        body.id,
+        body.pid ?? 0,
+        body.cwd,
+        body.git_root ?? null,
+        body.tty ?? null,
+        body.summary ?? "",
+        now,
+        now,
+        body.is_remote ? 1 : 0,
+      ],
+    );
+    return { ok: true, reregistered: true };
+  }
+
+  return { ok: false, needsRegister: true };
 }
 
 function handleSetSummary(body: SetSummaryRequest): void {
@@ -198,18 +223,8 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // Verify each peer's process is still alive (skip remote peers)
-  return peers.filter((p: any) => {
-    if (p.is_remote) return true; // Remote peers can't be PID-checked
-    try {
-      process.kill(p.pid, 0);
-      return true;
-    } catch {
-      // Clean up dead peer
-      deletePeer.run(p.id);
-      return false;
-    }
-  });
+  // Liveness is enforced by cleanStalePeers (heartbeat-based, no PID checks).
+  return peers;
 }
 
 function handleRegisterRemote(body: { id: string; cwd: string; summary: string; machine?: string }): { ok: boolean } {
@@ -275,8 +290,7 @@ Bun.serve({
         case "/register-remote":
           return Response.json(handleRegisterRemote(body as { id: string; cwd: string; summary: string; machine?: string }));
         case "/heartbeat":
-          handleHeartbeat(body as HeartbeatRequest);
-          return Response.json({ ok: true });
+          return Response.json(handleHeartbeat(body as HeartbeatRequest));
         case "/set-summary":
           handleSetSummary(body as SetSummaryRequest);
           return Response.json({ ok: true });
