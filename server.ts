@@ -158,6 +158,7 @@ let myGitRoot: string | null = null;
 // no-op silently and the peer would stay ghost forever.
 let myTty: string | null = null;
 let mySummary = "";
+let clientHasChannel = false;
 
 // --- MCP Server ---
 
@@ -256,7 +257,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
-  const { name, arguments: args } = req.params;
+  const __toolResponse: any = await (async () => {
+    const { name, arguments: args } = req.params;
 
   switch (name) {
     case "list_peers": {
@@ -385,7 +387,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId, mark_delivered: true });
         if (result.messages.length === 0) {
           return {
             content: [{ type: "text" as const, text: "No new messages." }],
@@ -418,12 +420,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
+  })();
+
+  // Auto-drain peer messages for non-channel clients (Grok TUI etc.)
+  // Bobby 2026-05-27: pendingMessageHint helper from prior Developer/ snapshot
+  // doesn't exist in canonical; instead wrap every tool response to inline
+  // any pending peer messages so non-channel clients see them without
+  // needing an explicit check_messages call.
+  if (!clientHasChannel && myId) {
+    try {
+      const drain = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId, mark_delivered: true });
+      if (drain.messages.length > 0) {
+        const drainedText = `\n\n📬 ${drain.messages.length} peer message(s) auto-drained:\n\n` +
+          drain.messages.map((m: any) => `── from ${m.from_id} at ${m.sent_at} ──\n${m.text}`).join("\n\n---\n\n");
+        const lastText = __toolResponse?.content?.filter((c: any) => c.type === "text").pop();
+        if (lastText) lastText.text += drainedText;
+      }
+    } catch {
+      // Don't fail the original tool call if drain fails
+    }
+  }
+
+  return __toolResponse;
 });
 
 // --- Polling loop for inbound messages ---
 
 async function pollAndPushMessages() {
-  if (!myId) return;
+  if (!myId || !clientHasChannel) return;
 
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
@@ -601,6 +625,18 @@ async function main() {
   // 5. Connect MCP over stdio
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
+
+  // Detect whether the MCP client (Grok TUI, Claude Code, etc.) supports
+  // the experimental claude/channel capability for immediate push notifications.
+  // Grok Build TUI and other non-Claude clients will not declare it.
+  const caps = mcp.getClientCapabilities?.();
+  clientHasChannel = !!(
+    caps?.experimental && (caps.experimental as Record<string, unknown>)["claude/channel"]
+  );
+  log(`Client capabilities: claude/channel = ${clientHasChannel}`);
+  if (!clientHasChannel) {
+    log("Channel push disabled; inbound peer messages will be drained via check_messages tool only (no background polling).");
+  }
 
   // 5b. Self-greet — if a SessionStart hook left a pending greet sentinel for
   // this CWD, push it as a channel notification so Claude announces itself
