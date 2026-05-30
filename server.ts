@@ -519,13 +519,40 @@ async function pushSelfGreet() {
     return;
   }
 
-  const content = `Auto-greet on session start. Your peer name is **${data.name}**. Read the prior KKN session below, then immediately respond with: "${data.name} checking in — here's where we left off:" followed by a 2-3 sentence recap of the most relevant items (what shipped, what's open, what's next). No user prompt needed — say it now.
+  // Deterministic detectability: the auto-generated startup summary (gpt-5.4-nano)
+  // almost never contains the peer NAME, which is exactly why a fresh session's
+  // shell scan can't see a live "Bobby"/"Sam"/"Dean" and hands out a duplicate.
+  // Prefix this session's broker summary with the suggested name so the NEXT
+  // session's scan can detect us by name. The name is still only a suggestion —
+  // the agent re-confirms via list_peers and re-sets the summary below — but a
+  // provisional name-bearing summary closes the invisibility gap immediately.
+  if (myId) {
+    const base = mySummary && mySummary.trim() ? mySummary.trim() : "session starting";
+    const named = base.toLowerCase().startsWith(data.name.toLowerCase())
+      ? base
+      : `${data.name} — ${base}`;
+    try {
+      await brokerFetch("/set-summary", { id: myId, summary: named });
+      mySummary = named; // keep heartbeat self-heal payload current
+      log(`Provisional name-bearing summary set: ${named}`);
+    } catch (e) {
+      log(`Could not set provisional summary: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
 
-Latest KKN session file: ${data.session_path}
+  const recapBlock =
+    data.session_content && data.session_content.trim()
+      ? `\n\nThe prior KKN session for "${data.name}" is below — use it for the recap ONLY after you've confirmed the name.\n\n--- BEGIN PRIOR SESSION ---\n${data.session_content}\n--- END PRIOR SESSION ---`
+      : `\n\n(No prior KKN session found for "${data.name}".)`;
 
---- BEGIN PRIOR SESSION ---
-${data.session_content}
---- END PRIOR SESSION ---`;
+  const content = `Auto-greet on session start. SUGGESTED peer name: **${data.name}** — this is a shell-scan SUGGESTION, NOT a confirmed assignment. Unnamed peers don't broadcast a name, so a scan can miss a live "${data.name}".
+
+BEFORE you announce anything or recap:
+1. Call list_peers (scope: machine) and check whether "${data.name}" is already live (inspect CWDs/TTYs; remember the broker excludes YOUR own entry).
+2. If "${data.name}" is free, keep it. If it's taken, pick the next free name from Bobby/Sam/Dean (or ask Ben).
+3. Call set_summary with a summary that BEGINS with your confirmed name (e.g. "<Name> — ...") so future sessions can detect you.
+
+THEN respond with "<confirmed name> checking in — here's where we left off:" and a 2-3 sentence recap (what shipped, what's open, what's next). No user prompt needed — do the verification, then say it.${recapBlock}`;
 
   await mcp.notification({
     method: "notifications/claude/channel",
