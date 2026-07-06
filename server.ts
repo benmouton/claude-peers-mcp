@@ -46,7 +46,12 @@ function deterministicRemoteId(): string {
   const { hostname, username } = require("os").userInfo
     ? { hostname: require("os").hostname(), username: require("os").userInfo().username }
     : { hostname: "unknown", username: "unknown" };
-  const raw = `${hostname}:${username}`;
+  // PID is REQUIRED in the hash: hostname:username alone collapses every
+  // concurrent session on one machine into a single peer slot (the 5/21 and
+  // 7/6 "Jack never got the message" incidents — whichever session polls
+  // first drains the other's inbox). PID keeps the ID stable across
+  // compaction (same process survives) while separating concurrent sessions.
+  const raw = `${hostname}:${username}:${process.pid}`;
   let hash = 0;
   for (let i = 0; i < raw.length; i++) {
     hash = ((hash << 5) - hash + raw.charCodeAt(i)) | 0;
